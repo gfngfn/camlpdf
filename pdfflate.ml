@@ -14,14 +14,14 @@ type flush_command =
 
 external deflate_init: int -> bool -> stream = "camlzip_deflateInit"
 external deflate:
-  stream -> string -> int -> int -> string -> int -> int -> flush_command
+  stream -> bytes -> int -> int -> bytes -> int -> int -> flush_command
          -> bool * int * int
   = "camlzip_deflate_bytecode" "camlzip_deflate"
 external deflate_end: stream -> unit = "camlzip_deflateEnd"
 
 external inflate_init: bool -> stream = "camlzip_inflateInit"
 external inflate:
-  stream -> string -> int -> int -> string -> int -> int -> flush_command
+  stream -> bytes -> int -> int -> bytes -> int -> int -> flush_command
          -> bool * int * int
   = "camlzip_inflate_bytecode" "camlzip_inflate"
 external inflate_end: stream -> unit = "camlzip_inflateEnd"

@@ -176,6 +176,7 @@ let rec make_outline_ntree source pdf = function
   | [] -> []
   | h::t ->
       let lower, rest = cleavewhile (fun {level = n'} -> n' > h.level) t in
+        (*Printf.printf "make_outline_ntree: %s\n" h.text;*)
         let node = node_of_line pdf h.text h.dest h.action in
           Br (fresh source pdf, node, make_outline_ntree source pdf lower, h.isopen)
             ::make_outline_ntree source pdf rest
@@ -217,7 +218,7 @@ and do_until_no_next_lb indent_lb pdf outline output =
             | None -> Pdfdest.NullDestination
             | Some action ->
                 match Pdf.lookup_direct pdf "/D" action with
-                | None -> Pdfdest.NullDestination
+                | None -> Pdfdest.Action (Pdf.direct pdf action)
                 | Some dest -> Pdfdest.read_destination pdf dest
       in let opn =
         match Pdf.lookup_direct pdf "/Count" outline with
@@ -225,7 +226,7 @@ and do_until_no_next_lb indent_lb pdf outline output =
         | _ -> false
       in
         output {level = !indent_lb; text = s; dest = page; action = NullAction; isopen = opn}
-    | _ -> ()
+    | _ -> raise (Pdf.PDFError "/Title not a string or not present in document outline entry")
     end;
     incr indent_lb;
     traverse_outlines_lb indent_lb pdf outline output;

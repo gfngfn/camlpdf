@@ -493,27 +493,28 @@ let lex_inline_image pdf resources i =
             Pdfread.dropwhite i;
             let c = char_of_int (i.input_byte ()) in
               let c' = char_of_int (i.input_byte ()) in
-                begin match c, c' with
-                | 'E', 'I' ->
-                    (* Remove filter, predictor, if it wasn't JPEG. *)
-                    let dict' =
-                      match
-                        Pdf.lookup_direct_orelse
-                        (Pdf.empty ()) "/F" "/Filter" dict
-                      with
-                      (* FIXME as above *)
-                      | Some (Pdf.Name ("/DCT" | "/DCTDecode") | Pdf.Array [Pdf.Name ("/DCT" | "/DCTDecode")]) -> dict
-                      | _ -> 
-                          fold_left
-                            Pdf.remove_dict_entry
-                            dict
-                            ["/Filter"; "/F"; "/DecodeParms"; "/DP"] 
-                    in
-                      dict', data
-                | x, y ->
-                   Printf.eprintf "bad end to inline image %C, %C\n" x y;
-                   nocontent i
-                end
+                if c <> 'E' || c' <> 'I' then
+                  begin
+                    Printf.eprintf "warning: bad end to inline image %C, %C\n" c c';
+                    (* We try to find "EI" anyway, in case there is just some junk.
+                     * To do this, we drop any whitespace and any E or I character. *)
+                    Pdfread.ignoreuntil true (fun x -> Pdf.is_not_whitespace x && x <> 'E' && x <> 'I') i;
+                  end;
+                (* Remove filter, predictor, if it wasn't JPEG. *)
+                let dict' =
+                  match
+                    Pdf.lookup_direct_orelse
+                    (Pdf.empty ()) "/F" "/Filter" dict
+                  with
+                  (* FIXME as above *)
+                  | Some (Pdf.Name ("/DCT" | "/DCTDecode") | Pdf.Array [Pdf.Name ("/DCT" | "/DCTDecode")]) -> dict
+                  | _ -> 
+                      fold_left
+                        Pdf.remove_dict_entry
+                        dict
+                        ["/Filter"; "/F"; "/DecodeParms"; "/DP"] 
+                in
+                  dict', data
     | _ ->
         Printf.eprintf "Did not recognise beginning of inline image ID\n";
         nocontent i
@@ -766,11 +767,13 @@ let parse_operator compatibility = function
               begin match rev r with
               | Obj Pdfgenlex.LexLeftSquare::t ->
                   let elements =
-                    map
+                    option_map
                       (function
-                       | (Obj (Pdfgenlex.LexReal i)) -> Pdf.Real i
-                       | (Obj (Pdfgenlex.LexString s)) -> Pdf.String s
-                       | _ -> raise (Pdf.PDFError "malformed TJ elt"))
+                       | (Obj (Pdfgenlex.LexReal i)) -> Some (Pdf.Real i)
+                       | (Obj (Pdfgenlex.LexString s)) -> Some (Pdf.String s)
+                       | e ->
+                           Printf.eprintf "Warning: malformed TJ element; skipping\n";
+                           None)
                       t
                   in
                     Op_TJ (Pdf.Array elements)
@@ -778,7 +781,7 @@ let parse_operator compatibility = function
               end
           | Op _::_ as l -> Op_Unknown (string_of_lexemes l)
           | l ->
-             Printf.eprintf "Empty or malformed graphics operation.";
+             Printf.eprintf "Empty or malformed graphics operation %s.\n" (string_of_lexemes l);
              Op_Unknown (string_of_lexemes l)
       in
         r, more

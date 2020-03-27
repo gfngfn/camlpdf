@@ -652,10 +652,12 @@ so only those in the range are kept. *)
  * previous call to Pdf.page_reference_numbers *)
 let pagenumber_of_target ?fastrefnums pdf = function
  | Pdfdest.NullDestination -> 0
+ | Pdfdest.NamedDestinationElsewhere _ -> 0
+ | Pdfdest.Action _ -> 0
  | Pdfdest.XYZ (t, _, _, _) | Pdfdest.Fit t | Pdfdest.FitH (t, _) | Pdfdest.FitV (t, _)
  | Pdfdest.FitR (t, _, _, _, _) | Pdfdest.FitB t | Pdfdest.FitBH (t, _) | Pdfdest.FitBV (t, _) ->
      match t with
-     | Pdfdest.OtherDocPageNumber _ -> 0
+     | Pdfdest.OtherDocPageNumber i -> i + 1 (* If it's really a Pdfdest.OtherDocPageNumber, you must process this yourself before. *)
      | Pdfdest.PageObject i ->
          match fastrefnums with
          | Some table ->
@@ -790,6 +792,29 @@ let rec fixup_duplicate_pages pdf =
           fixup_duplicate_pages pdf
       | _ -> ()
 
+(* When there are duplicate pages, even once de-duplicated by
+ * fixup_duplicate_pages, we can end up with incorrect /Parent links. This
+ * procedure rewrites them. *)
+let rec fixup_parents_inner pdf parent_objnum objnum =
+  (*Printf.printf "fixup_parents_inner %i %i\n" parent_objnum objnum;*)
+  let obj = Pdf.lookup_obj pdf objnum in
+    begin match Pdf.indirect_number pdf "/Parent" obj with
+      Some _ ->
+        Pdf.addobj_given_num pdf (objnum, (Pdf.add_dict_entry obj "/Parent" (Pdf.Indirect parent_objnum)))
+    | _ -> ()
+    end;
+    begin match Pdf.lookup_direct pdf "/Kids" obj with
+      Some (Pdf.Array kids) ->
+        iter (function Pdf.Indirect x -> fixup_parents_inner pdf objnum x | _ -> ()) kids
+    | _ -> ()
+    end
+
+let fixup_parents pdf =
+  let root = Pdf.lookup_obj pdf pdf.Pdf.root in
+    match Pdf.indirect_number pdf "/Pages" root with
+      Some pagetreeroot -> fixup_parents_inner pdf 0 pagetreeroot
+    | _ -> raise (Pdf.PDFError "fixup_parents: no page tree root")
+
 let pdf_of_pages ?(retain_numbering = false) basepdf range =
   let page_labels =
     if List.length (Pdfpagelabels.read basepdf) = 0 then [] else
@@ -869,19 +894,10 @@ let pdf_of_pages ?(retain_numbering = false) basepdf range =
                      replace_inherit objnum "/Resources")
                 objnumbers;
               let thetree = pagetree_with_objnumbers true old_pagetree_root_num (source pdf.Pdf.objects.Pdf.maxobjnum) objnumbers 0 in
-              let rec findparent objnum = function
-              | OLf (objnumbers, parent, this) -> if mem objnum objnumbers then Some this else None
-              | OBr (objnumbers, left, right, _, this) ->
-                  if mem objnum objnumbers then Some this else
-                    match findparent objnum left with
-                    | Some parent -> Some parent
-                    | None -> findparent objnum right
-              in
               (* 2. Kill the old page tree, excepting pages which will appear in the new
               PDF. It will link, via /Parent entries etc, to the new page tree. To do
               this, we remove all objects with /Type /Page or /Type /Pages. The other
-              places that null can appear, in destinations and so on, are ok, we think.
-              Also, rewrite /Parent entries to point directly to the page root.  *)
+              places that null can appear, in destinations and so on, are ok, we think. *)
               Pdf.objiter
                 (fun i o ->
                   match o with
@@ -889,15 +905,7 @@ let pdf_of_pages ?(retain_numbering = false) basepdf range =
                       begin match lookup "/Type" d with
                       | Some (Pdf.Name ("/Pages")) -> Pdf.removeobj pdf i
                       | Some (Pdf.Name ("/Page")) ->
-                          if mem i objnumbers
-                            then
-                              begin match findparent i thetree with
-                              | Some p ->
-                                  Pdf.addobj_given_num pdf (i, (Pdf.Dictionary (add "/Parent" (Pdf.Indirect p) d)))
-                              | None -> raise (Pdf.PDFError "pdf_of_pages internal inconsistency")
-                              end
-                            else
-                              Pdf.removeobj pdf i
+                          if not (mem i objnumbers) then Pdf.removeobj pdf i
                       | _ -> ()
                       end
                   | _ -> ())
@@ -910,6 +918,7 @@ let pdf_of_pages ?(retain_numbering = false) basepdf range =
                     Pdfpagelabels.write pdf page_labels;
                     let pdf = Pdfmarks.add_bookmarks marks pdf in
                       fixup_duplicate_pages pdf;
+                      fixup_parents pdf;
                       pdf
 
 let prepend_operators pdf ops ?(fast=false) page =
@@ -936,7 +945,7 @@ let protect pdf resources content =
 let postpend_operators pdf ops ?(fast=false) page =
   if fast then
     {page with content =
-       [Pdfops.stream_of_ops ([Pdfops.Op_q] @ ops @ [Pdfops.Op_Q])] @ page.content}
+       page.content @ [Pdfops.stream_of_ops ([Pdfops.Op_q] @ ops @ [Pdfops.Op_Q])]}
   else
     let beforeops =
       [Pdfops.Op_q]
@@ -950,9 +959,11 @@ let postpend_operators pdf ops ?(fast=false) page =
 let next_string s =
   if s = "" then "a" else
     if s.[0] = 'z' then "a" ^ s else
-      let s' = String.copy s in
-         s'.[0] <- char_of_int (int_of_char s'.[0] + 1);
-         s'
+      String.mapi
+        (fun i c ->
+           if i = 0 then char_of_int (int_of_char c + 1)
+           else c)
+        s
 
 (* True if one string [p] is a prefix of another [n] *)
 let is_prefix p n =
@@ -1010,11 +1021,17 @@ let addp p n =
   if n = "" then raise (Pdf.PDFError "addp: blank name") else
     "/" ^ p ^ String.sub n 1 (String.length n - 1)
 
+let direct_cs_names =
+  ["/DeviceGray"; "/DeviceRGB"; "/DeviceCMYK"; "/Pattern"]
+
+let direct_cs_names_inline =
+  ["/DeviceGray"; "/DeviceRGB"; "/DeviceCMYK"; "/G"; "/RGB"; "/CMYK"]
+
 let prefix_operator pdf p = function
   | Pdfops.Op_Tf (f, s) -> Pdfops.Op_Tf (addp p f, s)
   | Pdfops.Op_gs n -> Pdfops.Op_gs (addp p n)
-  | Pdfops.Op_CS n -> Pdfops.Op_CS (addp p n)
-  | Pdfops.Op_cs n -> Pdfops.Op_cs (addp p n)
+  | Pdfops.Op_CS n -> Pdfops.Op_CS (if mem n direct_cs_names then n else addp p n)
+  | Pdfops.Op_cs n -> Pdfops.Op_cs (if mem n direct_cs_names then n else addp p n)
   | Pdfops.Op_SCNName (s, ns) -> Pdfops.Op_SCNName (addp p s, ns)
   | Pdfops.Op_scnName (s, ns) -> Pdfops.Op_scnName (addp p s, ns)
   | Pdfops.Op_sh s -> Pdfops.Op_sh (addp p s)
@@ -1025,12 +1042,7 @@ let prefix_operator pdf p = function
       (* Replace any indirect "/CS" or "/ColorSpace" with a new "/CS" *)
       let dict' =
         match Pdf.lookup_direct_orelse pdf "/CS" "/ColorSpace" dict with
-        | Some (Pdf.Name "/DeviceGray")
-        | Some (Pdf.Name "/DeviceRGB")
-        | Some (Pdf.Name "/DeviceCMYK")
-        | Some (Pdf.Name "/G")
-        | Some (Pdf.Name "/RGB")
-        | Some (Pdf.Name "/CMYK") -> dict
+        | Some (Pdf.Name n) when mem n direct_cs_names_inline -> dict
         | Some (Pdf.Name n) ->
             Pdf.add_dict_entry
               (Pdf.remove_dict_entry
@@ -1046,8 +1058,8 @@ let prefix_operator pdf p = function
 let change_resources pdf prefix resources =
   let newdict name =
     match Pdf.lookup_direct pdf name resources with
-    | Some (Pdf.Dictionary fonts) ->
-        Pdf.Dictionary (map (fun (k, v) -> addp prefix k, v) fonts)
+    | Some (Pdf.Dictionary dict) ->
+        Pdf.Dictionary (map (fun (k, v) -> addp prefix k, v) dict)
     | _ -> Pdf.Dictionary []
   in
     let newdicts = map newdict resource_keys in
@@ -1123,4 +1135,3 @@ let add_prefix pdf prefix =
        | _ -> obj)
     pdf(*;
     Printf.eprintf "***add_prefix has concluded\n";*)
-

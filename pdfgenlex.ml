@@ -68,7 +68,10 @@ let lex_item s =
                 | _ -> isint s (pos - 1)
             in
               if isint s (len - 1)
-                then LexInt (int_of_string s)
+                then
+                  begin try LexInt (int_of_string s) with
+                    _ -> LexReal (float_of_string s) (* Integer > 2^30 on 32 bit system, int_of_string would fail. *)
+                  end
                 else LexReal (float_of_string s)
       with
         _ -> LexName (String.copy s)
@@ -89,31 +92,15 @@ let rec lengthuntil i n =
 float_of_string etc. What we actually need is int_of_substring etc, but this
 will require patching OCaml. *)
 let strings =
- [|"";
-   " ";
-   "  ";
-   "   ";
-   "    ";
-   "     ";
-   "      ";
-   "       ";
-   "        ";
-   "         ";
-   "          ";
-   "           ";
-   "            ";
-   "             ";
-   "              ";
-   "               ";
-   "                "|]
+  Array.init 17 (fun i -> Bytes.make i ' ')
 
 let getuntil i =
   let p = i.Pdfio.pos_in () in
     let l = lengthuntil i 0 in
       i.Pdfio.seek_in p;
-      let s = if l <= 16 then Array.unsafe_get strings l else String.create l in
+      let s = if l <= 16 then Array.unsafe_get strings l else Bytes.create l in
         Pdfio.setinit_string i s 0 l;
-        s
+        Bytes.unsafe_to_string s (* Will never be altered, but copied or discarded by get_string_inner. *)
 
 (* The same, but don't return anything. *)
 let rec ignoreuntil f i =

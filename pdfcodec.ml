@@ -1,6 +1,8 @@
 open Pdfutil
 open Pdfio
 
+let debug = ref false
+
 (* Zlib inflate level *)
 let flate_level = ref 6
 
@@ -242,17 +244,17 @@ let flate_process f data =
   and inlength = bytes_size data in
     let input =
       (fun buf ->
-         let s = String.length buf in
+         let s = Bytes.length buf in
            let towrite = min (inlength - !pos) s in
              for x = 0 to towrite - 1 do
-               String.unsafe_set
+               Bytes.unsafe_set
                  buf x (Char.unsafe_chr (bget_unsafe data !pos));
                  incr pos
              done;
              towrite)
     and output =
       (fun buf length ->
-         if length > 0 then strings =| String.sub buf 0 length)
+         if length > 0 then strings =| Bytes.sub_string buf 0 length)
     in
       f input output;
       bytes_of_strings_rev !strings
@@ -264,17 +266,17 @@ let decode_flate_input i =
   let strings = ref [] in
     let input =
       (fun buf ->
-         let s = String.length buf in
+         let s = Bytes.length buf in
            if s > 0 then
              begin
                match i.input_byte () with
                | x when x = Pdfio.no_more -> raise End_of_file
-               | x -> String.unsafe_set buf 0 (char_of_int x); 1
+               | x -> Bytes.unsafe_set buf 0 (char_of_int x); 1
              end
            else 0)
     and output =
       (fun buf length ->
-         if length > 0 then strings =| String.sub buf 0 length)
+         if length > 0 then strings =| Bytes.sub_string buf 0 length)
     in
       Pdfflate.uncompress input output;
       bytes_of_strings_rev !strings
@@ -282,11 +284,18 @@ let decode_flate_input i =
 let encode_flate stream =
   flate_process (Pdfflate.compress ~level:!flate_level) stream
 
+let debug_stream s =
+  Printf.eprintf "First 50 bytes\n";
+  for x = 0 to 50 do
+    Printf.eprintf "%C = %i\n" (char_of_int (bget s x)) (bget s x)
+  done
+
 let decode_flate stream =
   if bytes_size stream = 0 then mkbytes 0 else (* Accept the empty stream. *)
     try flate_process Pdfflate.uncompress stream with
       Pdfflate.Error (a, b) ->
-        raise (Couldn'tDecodeStream ("Flate" ^ " " ^ a ^ " " ^ b))
+        if !debug then debug_stream stream;
+        raise (Couldn'tDecodeStream ("Flate" ^ " " ^ a ^ " " ^ b ^ " length " ^ string_of_int (bytes_size stream)))
 
 (* LZW *)
 

@@ -81,6 +81,8 @@ val shortest_unused_prefix : Pdf.t -> string
 
 val add_prefix : Pdf.t -> string -> unit
 
+val protect : Pdf.t -> Pdf.pdfobject -> Pdf.pdfobject list -> Pdfops.t list
+
 val prepend_operators : Pdf.t -> Pdfops.t list -> ?fast:bool -> t -> t
 
 val postpend_operators : Pdf.t -> Pdfops.t list -> ?fast:bool -> t -> t

@@ -48,6 +48,8 @@ let merge_bookmarks changes pdfs ranges pdf =
     let process_mark oldnums changes mark = 
       let pageobjectnumber_of_target = function
         | Pdfdest.NullDestination -> 0
+        | Pdfdest.NamedDestinationElsewhere _ -> 0
+        | Pdfdest.Action _ -> 0
         | Pdfdest.XYZ (t, _, _, _) | Pdfdest.Fit t | Pdfdest.FitH (t, _) | Pdfdest.FitV (t, _)
         | Pdfdest.FitR (t, _, _, _, _) | Pdfdest.FitB t | Pdfdest.FitBH (t, _) | Pdfdest.FitBV (t, _) ->
             match t with
@@ -64,7 +66,9 @@ let merge_bookmarks changes pdfs ranges pdf =
                   | Pdfdest.PageObject _ -> Pdfdest.PageObject n 
                 in
                   match target with
+                  | Pdfdest.Action a -> Pdfdest.Action a
                   | Pdfdest.NullDestination -> Pdfdest.NullDestination
+                  | Pdfdest.NamedDestinationElsewhere s -> Pdfdest.NamedDestinationElsewhere s
                   | Pdfdest.XYZ (t, a, b, c) -> Pdfdest.XYZ (change_targetpage t, a, b, c)
                   | Pdfdest.Fit t -> Pdfdest.Fit (change_targetpage t)
                   | Pdfdest.FitH (t, a) -> Pdfdest.FitH (change_targetpage t, a)
@@ -157,7 +161,11 @@ let rec read_name_tree pdf tree =
     match Pdf.lookup_direct pdf "/Names" tree with
     | Some (Pdf.Array elts) ->
         if odd (length elts)
-          then raise (Pdf.PDFError "Bad /Names")
+          then
+             begin
+               Printf.eprintf "Bad /Names array. Name tree will be read as empty\n";
+               []
+             end
           else pairs_of_list elts
     | _ -> []
   in
@@ -166,19 +174,52 @@ let rec read_name_tree pdf tree =
         names @ flatten (map (read_name_tree pdf) kids)
     | _ -> names
 
-(* Build a name tree from a flattened list, FIXME: Inefficient: we should build
-a proper tree. *)
-let build_name_tree _ ls =
-  let ls = sort (fun (k, _) (k', _) -> compare k k') ls in
-    let list_of_pair (k, v) = [k; v] in
-      let arr = flatten (map list_of_pair ls) in
-        Pdf.Dictionary ["/Names", Pdf.Array arr]
+let read_name_tree pdf tree =
+  let r = read_name_tree pdf tree in
+    List.map (function (Pdf.String s, x) -> (s, x) | _ -> raise (Pdf.PDFError "malformed name tree")) r
 
-(* Merge name trees *)
-let merge_name_trees pdf trees =
+let maxsize = 10 (* Must be at least two *)
+
+type ('k, 'v) nt =
+  Br of 'k * ('k, 'v) nt list * 'k
+| Lf of 'k * ('k * 'v) list * 'k
+
+let left l = fst (hd l)
+let right l = fst (last l)
+
+let rec build_nt_tree l =
+  if List.length l = 0 then assert false;
+  if List.length l <= maxsize
+    then Lf (left l, l, right l)
+    else Br (left l, List.map build_nt_tree (splitinto (List.length l / maxsize) l), right l)
+
+let rec name_tree_of_nt isroot pdf = function
+  Lf (llimit, items, rlimit) ->
+    Pdf.Dictionary
+      ([("/Names", Pdf.Array (List.flatten (List.map (fun (k, v) -> [Pdf.String k; v]) items)))] @
+       if isroot then [] else [("/Limits", Pdf.Array [Pdf.String llimit; Pdf.String rlimit])])
+| Br (llimit, nts, rlimit) ->
+    let indirects =
+      let kids = List.map (name_tree_of_nt false pdf) nts in
+        List.map (Pdf.addobj pdf) kids
+    in
+      Pdf.Dictionary
+       [("/Kids", Pdf.Array (List.map (fun x -> Pdf.Indirect x) indirects));
+        ("/Limits", Pdf.Array [Pdf.String llimit; Pdf.String rlimit])]
+
+let build_name_tree pdf = function
+  | [] -> Pdf.Dictionary [("/Names", Pdf.Array [])]
+  | ls ->
+      let nt = build_nt_tree (sort compare ls) in
+        name_tree_of_nt true pdf nt
+
+
+
+(* Once we know there are no clashes *)
+let merge_name_trees_no_clash pdf trees =
   build_name_tree pdf (flatten (map (read_name_tree pdf) trees))
 
-(* Merging entries in the Name Dictionary *)
+(* Merging entries in the Name Dictionary. [pdf] here is the new merged pdf, [pdfs] the original ones. *)
 let merge_namedicts pdf pdfs =
   let names =
     ["/Dests"; "/AP"; "/JavaScript"; "/Pages"; "/Templates"; "/IDS";
@@ -190,7 +231,7 @@ let merge_namedicts pdf pdfs =
         | Some d -> Pdf.lookup_direct pdf name d
         | None -> None
     in
-    (* Build a list of the lists of number trees for each name *)
+    (* Build a list of the lists of trees for each name *)
     let trees_in_each =
       map (fun name -> option_map (gettree name) pdfs) names
     in
@@ -202,7 +243,7 @@ let merge_namedicts pdf pdfs =
       in
         let new_trees =
           map
-            (fun (name, trees) -> name, merge_name_trees pdf trees)
+            (fun (name, trees) -> name, merge_name_trees_no_clash pdf trees)
             with_names
         in
           (* Add all the trees as indirect references to the pdf *)
@@ -223,6 +264,30 @@ let merge_namedicts pdf pdfs =
             (* Return the new pdf, and the new dictionary. *)
             Pdf.addobj pdf newdict
 
+(* Merge name trees This needs to return some changes to be made to Annots when
+ * names in the trees might clash. e.g if the name /A appears in two trrees, we
+ * might return (6, "/A", "/A-6") to indicate all uses of "/A" in PDF number 6
+ * must be rewritten to "/A-6" *)
+(* For now, only operates on /Dests, because for now we only know how to find all
+ * the uses of these dest names. To merge any of the others properly, we need
+ * to find out how to find every instance of their use in the file. We can't
+ * just assume any string object is a name tree key *)
+(* This runs after merge_pdfs_renumber, so there can be no clashing of values.
+ * We can return the OCaml name tree structure safe in the knowledge that it
+ * can be written to the eventual merged PDF and the object numbers will be
+ * correct. *)
+let merge_pdfs_rename_name_trees names pdfs = pdfs
+  (* Find the /Dests nametree in each file *)
+  (* Calculate the changes *)
+  (* Apply the changes to the name tree *)
+  (* Apply the changes to each PDFs annots entries and anywhere else Dests can be used. *)
+  (* Build our name tree OCaml structure for the merged tree and return. *)
+
+(* FIXME: The problem here is that we may need to break the non-copy of a file
+ * multiply included in a merge, since we need to alter its destination
+ * objects. It's hard to see a way around this without removing that
+ * functionality. See comments in cpdf-source github issue 79. *)
+
 (* Merge catalog items from the PDFs, taking an abitrary instance of any one we
  * find. Items we know how to merge properly, like /Dests, /Names, /PageLabels,
  * /Outlines, will be overwritten, so we don't worry about them here. *)
@@ -240,6 +305,7 @@ let catalog_items_from_original_documents pdfs =
 
 let merge_pdfs retain_numbering do_remove_duplicate_fonts names pdfs ranges =
   let pdfs = merge_pdfs_renumber names pdfs in
+  let pdfs = merge_pdfs_rename_name_trees names pdfs in
     let minor' = fold_left max 0 (map (fun p -> p.Pdf.minor) pdfs) in
       let pagelists = map Pdfpage.pages_of_pagetree pdfs
       in let pdf = Pdf.empty () in

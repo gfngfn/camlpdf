@@ -1,7 +1,5 @@
 (** Reading PDF Files *)
 
-val read_debug : bool ref
-
 (** Read a PDF from a [Pdfio.input], with an optional user password which, if
 absent, is assumed to be the empty string, and optional owner password. *)
 val pdf_of_input : ?revision:int -> string option -> string option -> Pdfio.input -> Pdf.t
@@ -29,6 +27,10 @@ val revisions : Pdfio.input -> int
 
 (* For internal use by other parts of the library *)
 
+val read_debug : bool ref
+val error_on_malformed : bool ref
+val debug_always_treat_malformed : bool ref
+
 val read_header : (Pdfio.input -> int * int)
 
 val lex_stream_data : Pdfio.input -> int -> bool -> Pdfgenlex.t
@@ -52,6 +54,8 @@ val lex_dictionary : Pdfio.input -> Pdfgenlex.t list
 val parse : ?failure_is_ok:bool -> Pdfgenlex.t list -> int * Pdf.pdfobject
 
 val dropwhite : Pdfio.input -> unit
+
+val ignoreuntil : bool -> (char -> bool) -> Pdfio.input -> unit
 
 val print_lexeme : Pdfgenlex.t -> unit
 

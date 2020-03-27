@@ -4,6 +4,8 @@ open Pdfio
 open Pdfgenlex
 
 let read_debug = ref false
+let error_on_malformed = ref false
+let debug_always_treat_malformed = ref false
 
 (* Predicate on newline characters (carriage return and linefeed). *)
 let is_newline = function
@@ -69,6 +71,7 @@ let rec read_header_inner pos i =
                   (Pdf.PDFError (Pdf.input_pdferror i "Malformed PDF header"))
               else
                 begin
+                  if !read_debug then Printf.eprintf "setting offset to %i\n" pos;
                   i.set_offset pos;
                   int_of_string (string_of_char major), int_of_string (implode minorchars)
                 end
@@ -378,8 +381,7 @@ reaching past the end of a file, in which case an exception is raised. *)
 let read_chunk n i =
   try
     let orig_pos = i.pos_in () in
-      let s = String.create n in
-        for x = 0 to n - 1 do s.[x] <- unopt (i.input_char ()) done;
+      let s = String.init n (fun _ -> unopt (i.input_char ())) in
         i.seek_in orig_pos;
         s
   with
@@ -513,7 +515,7 @@ let lex_stream i p previous_lexemes lexobj opt =
                  | Some l -> lex_stream_data i l opt
                with
                  _ ->
-                   (* When reading malfomed files, /Length could be indirect,
+                   (* When reading malformed files, /Length could be indirect,
                    and therefore not available. Treat as if it were available,
                    but incorrect. *)
                    i.seek_in pos;
@@ -988,10 +990,11 @@ let lex_stream_object
                 (Pdf.PDFError
                   (Pdf.input_pdferror i "couldn't decode objstream"))
           end
-    | _ ->
+    | stmobj ->
         raise
           (Pdf.PDFError
-            (Pdf.input_pdferror i "lex_stream_object: not a stream"))
+            (Pdf.input_pdferror i (Printf.sprintf "lex_stream_object: not a stream, but %s"
+                                   (Pdfwrite.string_of_pdf stmobj))))
 
 (* Advance to the first thing after the current pointer which is not a comment.
 *)
@@ -1193,13 +1196,13 @@ let read_xref_stream i =
         in let xrefs = ref [] in
           begin try
             if !read_debug then
-              Printf.printf "About to start read_xref_stream\n%!";
+              Printf.eprintf "About to start read_xref_stream\n%!";
             while true do xrefs =| read_xref_line_stream i' w1 w2 w3 done
 
           with
             _ ->
               if !read_debug then
-                Printf.printf "End of read_xref_stream\n%!";
+                Printf.eprintf "End of read_xref_stream\n%!";
               ()
           end;
           xrefs := rev !xrefs;
@@ -1285,6 +1288,16 @@ let is_linearized i =
 exception Revisions of int
 
 exception BadRevision
+
+let sanitize_trailerdict l trailerdict =
+  add "/Size" (Pdf.Integer l)
+    (remove "/W"
+      (remove "/Type"
+        (remove "/Index"
+          (remove "/Prev"
+            (remove "/XRefStm"
+              (remove "/Filter"
+                (remove "/DecodeParms" trailerdict)))))))
 
 (* Read a PDF from a channel. If [opt], streams are read immediately into
 memory. Revision: 1 = first revision, 2 = second revision etc. max_int = latest
@@ -1577,24 +1590,14 @@ let read_pdf ?revision user_pw owner_pw opt i =
       let objects = objects_stream @ objects_nonstream in
         (* Fix Size entry and remove Prev, XRefStm, Filter, Index, W, Type,
         and DecodeParms *)
-        let trailerdict' =
-          Pdf.Dictionary
-            (add "/Size" (Pdf.Integer (length objects))
-              (remove "/W"
-                (remove "/Type"
-                  (remove "/Index"
-                    (remove "/Prev"
-                      (remove "/XRefStm"
-                        (remove "/Filter"
-                          (remove "/DecodeParms" !trailerdict))))))))
-        in
+        let trailerdict' = sanitize_trailerdict (length objects) !trailerdict in
           let pdf = 
             {Pdf.major = major;
              Pdf.minor = minor;
              Pdf.objects =
                Pdf.objects_of_list (Some (get_object i xrefs)) objects;
              Pdf.root = root;
-             Pdf.trailerdict = trailerdict';
+             Pdf.trailerdict = Pdf.Dictionary trailerdict';
              Pdf.was_linearized = was_linearized;
              Pdf.saved_encryption = None}
           in
@@ -1661,8 +1664,17 @@ let read_malformed_trailerdict i =
     file position ends up at the end of the file. *)
     while
       let currpos = i.pos_in () in
-        try implode (take (explode (input_line i)) 7) <> "trailer" with
-          _ -> not (i.pos_in () = currpos)
+        try
+          let l = input_line i in
+            let r = 
+              implode (take (explode l) 7) <> "trailer"
+            in
+              (* In case of "trailer<<..." i.e a missing newline, we backtrack until
+               * just after the trailer keyword itself *)
+              i.seek_in (currpos + 7);
+              r
+        with
+          _ -> not (i.pos_in () = currpos || i.pos_in () >= i.in_channel_length)
     do () done;
     let lexemes =
       lex_object_at true i true parse (lex_object i (null_hash ()) parse true)
@@ -1712,25 +1724,26 @@ let rec advance_to_integer i =
 (* Read the actual objects, in order. *)
 let read_malformed_pdf_objects i =
   let objs = ref [] in
-    while i.pos_in () < i.in_channel_length do
+    (* Can't just test i.pos_in () < i.in_channel_length because of set_offset! *)
+    while let x = i.input_char () in rewind i; x <> None do
       let c = i.pos_in () in
         try
-          (*Printf.printf
-             "read_malformed_pdf_object is reading an object at %i\n" c;*)
+          if !read_debug then Printf.printf
+             "read_malformed_pdf_object is reading an object at %i\n" c;
           let objnum, obj =
             parse
               ~failure_is_ok:true
               (lex_object_at
                 true i true parse (lex_object i (null_hash ()) parse true))
           in
-            (*Printf.printf "Got object %i, which is %s ok\n"
-                objnum (Pdfwrite.string_of_pdf obj);*)
+            if !read_debug then Printf.printf "Got object %i, which is %s ok\n"
+                objnum (Pdfwrite.string_of_pdf obj);
             if objnum > 0 && objnum < max_int then objs := add objnum obj !objs;
             advance_to_integer i; (* find next possible object *)
             if i.pos_in () = c then ignore (input_line i) (* no progress. *)
         with
           e ->
-            (*Printf.printf "Couldn't get object, moving on\n";*)
+            if !read_debug then Printf.printf "Couldn't get object, moving on\n";
             ignore (input_line i) (* Move on *)
     done;
     !objs
@@ -1738,6 +1751,7 @@ let read_malformed_pdf_objects i =
 let read_malformed_pdf upw opw i =
   Printf.eprintf
     "Attempting to reconstruct the malformed pdf %s...\n" i.Pdfio.source;
+  flush stderr;
   let trailerdict = read_malformed_trailerdicts i
   and major, minor = read_header i in
     i.Pdfio.seek_in 0;
@@ -1748,14 +1762,20 @@ let read_malformed_pdf upw opw i =
     in
       Printf.eprintf "Read %i objects\n" (length objects);
       let root =
+        if !read_debug then Printf.printf "trailerdict is %s\n" (Pdfwrite.string_of_pdf (Pdf.Dictionary trailerdict));
         match lookup "/Root" trailerdict with
         | Some (Pdf.Indirect i) -> i
         | None ->
+            if !read_debug then Printf.printf "No /Root entry in malformed file read\n";
             raise (Pdf.PDFError (Pdf.input_pdferror i "No /Root entry"))
         | _ ->
+            if !read_debug then Printf.printf "Malformed /Root entry in malformed file read\n";
             raise (Pdf.PDFError (Pdf.input_pdferror i "Malformed /Root entry"))
       in
         i.Pdfio.seek_in 0;
+        (* Fix Size entry and remove Prev, XRefStm, Filter, Index, W, Type,
+        and DecodeParms *)
+        let trailerdict' = sanitize_trailerdict (length objects) trailerdict in
         let was_linearized = is_linearized i in
           Printf.eprintf "Malformed PDF reconstruction succeeded!\n";
           flush stderr;
@@ -1763,30 +1783,41 @@ let read_malformed_pdf upw opw i =
            Pdf.minor = minor;
            Pdf.root = root;
            Pdf.objects = Pdf.objects_of_list None objects;
-           Pdf.trailerdict = Pdf.Dictionary trailerdict;
+           Pdf.trailerdict = Pdf.Dictionary trailerdict';
            Pdf.was_linearized = was_linearized;
            Pdf.saved_encryption = None}
-    
+
+let report_read_error i e e' =
+  raise
+    (Pdf.PDFError
+       (Pdf.input_pdferror
+          i
+          (Printf.sprintf
+             "Failed to read PDF - initial error was\n%s\n\n\
+             final error was \n%s\n\n"
+             (Printexc.to_string e)
+             (Printexc.to_string e'))))
+
 let read_pdf revision upw opw opt i =
-  try read_pdf ?revision upw opw opt i with
-  | Pdf.PDFError s as e
-      when String.length s >= 10 && String.sub s 0 10 = "Encryption" ->
-      (* If it failed due to encryption not supported or user password not
-      right, the error should be passed up - it's not a malformed file. *)
-      raise e
-  | BadRevision ->
-      raise (Pdf.PDFError "Revision number too low when reading PDF")
-  | e ->
-      try read_malformed_pdf upw opw i with e' ->
-        raise
-          (Pdf.PDFError
-             (Pdf.input_pdferror
-                i
-                (Printf.sprintf
-                   "Failed to read PDF - initial error was\n%s\n\n\
-                   final error was \n%s\n\n"
-                   (Printexc.to_string e)
-                   (Printexc.to_string e'))))
+  if !debug_always_treat_malformed then
+    try read_malformed_pdf upw opw i with
+      e -> report_read_error i e e
+  else
+    try read_pdf ?revision upw opw opt i with
+    | Pdf.PDFError s as e
+        when String.length s >= 10 && String.sub s 0 10 = "Encryption" ->
+        (* If it failed due to encryption not supported or user password not
+        right, the error should be passed up - it's not a malformed file. *)
+        raise e
+    | BadRevision ->
+        raise (Pdf.PDFError "Revision number too low when reading PDF")
+    | e ->
+        if !error_on_malformed then raise e else
+          begin
+            Printf.eprintf "Because of error %s, will read as malformed.\n" (Printexc.to_string e);
+            try read_malformed_pdf upw opw i with e' ->
+              report_read_error i e e'
+           end
 
 (* Read a PDF into memory, including its streams. *)
 let pdf_of_channel ?revision ?(source = "channel") upw opw ch =
