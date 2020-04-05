@@ -1,10 +1,9 @@
 # Build the camlpdf library as byte code and, if available, native code
 PDFMODS = pdfutil pdfio pdftransform pdfunits pdfpaper pdfcryptprimitives \
   pdf pdfcrypt pdfflate pdfcodec pdfwrite pdfgenlex pdfread pdfjpeg pdfops \
-  pdfdest pdfmarks pdfpagelabels pdfpage pdfannot pdffun pdfspace pdfimage \
+  pdfdest pdfaction pdfmarks pdfpagelabels pdfpage pdfannot pdffun pdfspace pdfimage \
   pdfafm pdfafmdata pdfglyphlist pdftext pdfstandard14 pdfgraphics pdfshapes \
-  pdfdate pdfocg pdfcff pdftype1 pdftruetype pdftype0 pdfmerge \
-  pdfaction
+  pdfdate pdfocg pdfcff pdftype1 pdftruetype pdftype0 pdfmerge
 
 SOURCES = flatestubs.c rijndael-alg-fst.c stubs-aes.c sha2.c stubs-sha2.c \
 	  $(foreach x,$(PDFMODS),$(x).ml $(x).mli)
